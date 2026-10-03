@@ -1,3 +1,32 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Builds a CrowdStrike Falcon custom IOA rule group that flags common RMM tool executables.
+.DESCRIPTION
+    Downloads the RMM tool catalog from lolrmm.io, generates one Windows Process custom IOA rule
+    per tool that has at least one identifiable .exe pattern, packages the rule group as a
+    Falcon-importable JSON/zip file, and optionally uploads it via the PSFalcon module.
+.PARAMETER StartingRuleId
+    The first instance_id assigned to generated rules. Each subsequent rule increments by 1.
+.PARAMETER ZipFile
+    Path to the zip archive that will contain the exported rule group JSON.
+.PARAMETER EnableRules
+    Create the rules themselves in an enabled state. Default is disabled.
+.PARAMETER DisableRuleGroup
+    Create the rule group in a disabled state. Default is enabled.
+.PARAMETER Severity
+    pattern_severity applied to every generated rule.
+.PARAMETER ResponseType
+    Disposition applied to every generated rule: monitor (10), detect (20, default), or block (30).
+.PARAMETER RmmToolsUrl
+    Source URL for the RMM tool catalog JSON.
+.PARAMETER OutputJsonPath
+    Local path for the intermediate rule group JSON file before compression.
+.EXAMPLE
+    ./Set-FalconRmmIOA.ps1 -StartingRuleId 60000 -ResponseType block -EnableRules
+#>
+
+[CmdletBinding()]
 param(
     [int]$StartingRuleId = 50000,
     [string]$ZipFile = "rmm_tools.zip",
@@ -6,130 +35,86 @@ param(
     [ValidateSet("informational", "low", "medium", "high", "critical")]
     [string]$Severity = "medium",
     [ValidateSet("monitor", "detect", "block")]
-    [string]$ResponseType = "detect"
+    [string]$ResponseType = "detect",
+    [string]$RmmToolsUrl = "https://lolrmm.io/api/rmm_tools.json",
+    [string]$OutputJsonPath = "IOAGroup.json"
 )
 
+#region Functions
+
 function Write-LogEntry {
+    [CmdletBinding()]
     param(
-        [string]$msg,
+        [Parameter(Mandatory)]
+        [string]$Message,
+
         [ValidateSet("warning", "error", "success", "info")]
-        [string]$level
+        [string]$Level = "info"
     )
 
-    $currentTime = Get-Date -Format G
+    $colorMap = @{ info = 'Cyan'; success = 'Green'; warning = 'Yellow'; error = 'Red' }
+    $symbolMap = @{ info = '*'; success = '+'; warning = '?'; error = '!' }
 
-    switch ($level) {
-        "warning" { 
-            write-host -ForegroundColor Yellow "[WARN] $($currentTime) - $($msg)"
-            break
-        }
-        "error" { 
-            write-host -ForegroundColor Red "[ERROR] $($currentTime) - $($msg)"
-            break
-        }
-        "success" { 
-            write-host -ForegroundColor Green "[OK] $($currentTime) - $($msg)"
-            break
-        }
-        "info" { 
-            write-host -ForegroundColor Cyan "[INFO] $($currentTime) - $($msg)"
-            break
-        }
-        Default { 
-            write-host "[INFO] $($currentTime) - $($msg)"
-            break
-        }
+    Write-Host "[$($symbolMap[$Level])] $(Get-Date -Format G) - $Message" -ForegroundColor $colorMap[$Level]
+}
+
+function ConvertTo-ExeNamePattern {
+    # Escapes regex metacharacters generically (not just '.'), then restores '*' as a '.*' wildcard,
+    # so filenames with parentheses/brackets/etc. from the feed don't break the generated regex.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [string]$Path
+    )
+    process {
+        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+        $escaped = [regex]::Escape($baseName) -replace '\\\*', '.*'
+        $escaped -replace ' ', '\s+'
     }
 }
 
 function Get-RMMData {
+    [CmdletBinding()]
+    [OutputType([object])]
     param(
-        [string]$url
+        [Parameter(Mandatory)]
+        [string]$Url
     )
 
     try {
-        return Invoke-RestMethod -Uri $url
+        Invoke-RestMethod -Uri $Url
     }
     catch {
-        Write-LogEntry -msg "Failed to retrieve or parse JSON data from $url. Error: $_" -level error
-        exit 1
+        Write-LogEntry -Message "Failed to retrieve or parse JSON data from $Url.`nError: $_" -Level error
+        throw
     }
-}
-
-function ConvertTo-ExeNameRegex {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Path
-    )
-
-    $name = [System.IO.Path]::GetFileNameWithoutExtension($Path)
-    if ([string]::IsNullOrWhiteSpace($name)) {
-        return $null
-    }
-
-    $name = [regex]::Escape($name)
-    $name = $name -replace '\\\*', '.*'
-    $name = $name -replace '\\ ', '\s+'
-
-    return $name
-}
-
-function ConvertTo-IoaFileNamePattern {
-    param(
-        [AllowNull()]
-        [string]$FileName
-    )
-
-    if ([string]::IsNullOrWhiteSpace($FileName)) {
-        return $null
-    }
-
-    $pattern = [System.IO.Path]::GetFileNameWithoutExtension($FileName)
-    if ([string]::IsNullOrWhiteSpace($pattern)) {
-        return $null
-    }
-
-    $pattern = [regex]::Escape($pattern)
-    $pattern = $pattern -replace '\\\*', '.*'
-    $pattern = $pattern -replace '\\ ', '\s+'
-
-    return $pattern
 }
 
 function Get-ExeFileNames {
-    param($tool)
-    $exeFileNames = New-Object System.Collections.Generic.HashSet[System.String]([System.StringComparer]::OrdinalIgnoreCase)
+    [CmdletBinding()]
+    [OutputType([System.Collections.Generic.HashSet[string]])]
+    param(
+        [Parameter(Mandatory)]
+        $Tool
+    )
 
-    if ($tool.Details.InstallationPaths -is [array]) {
-        foreach ($path in $tool.Details.InstallationPaths) {
-            if ($path -match "\.exe$") {
-                $fileName = ConvertTo-IoaFileNamePattern -FileName $path
-                if ($fileName) {
-                    $exeFileNames.Add($fileName) | Out-Null
-                }
-            }
+    $exeFileNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($path in @($Tool.Details.InstallationPaths)) {
+        if ($path -match '\.exe$') {
+            [void]$exeFileNames.Add((ConvertTo-ExeNamePattern -Path $path))
         }
     }
 
-    if ($tool.Details.PEMetaData) {
-        foreach ($item in @($tool.Details.PEMetaData)) {
-            if ($item.Filename -match '\.exe$') {
-                $fileName = ConvertTo-IoaFileNamePattern -FileName $item.Filename
-                if ($fileName) {
-                    $exeFileNames.Add($fileName)
-                }
-            }
-        }
+    $peExeFiles = @($Tool.Details.PEMetaData).Where({ $_.Filename -match '\.exe$' })
+    foreach ($pe in $peExeFiles) {
+        [void]$exeFileNames.Add((ConvertTo-ExeNamePattern -Path $pe.Filename))
     }
 
-    if ($tool.Artifacts.Disk.File) {
-        foreach ($file in $tool.Artifacts.Disk.File) {
-            if ($file -match '\.exe$') {
-                $fileName = ConvertTo-IoaFileNamePattern -FileName $file
-                if ($fileName) {
-                    $exeFileNames.Add($fileName)
-                }
-            }
+    foreach ($file in @($Tool.Artifacts.Disk.File)) {
+        if ($file -match '\.exe$') {
+            [void]$exeFileNames.Add((ConvertTo-ExeNamePattern -Path $file))
         }
     }
 
@@ -137,78 +122,51 @@ function Get-ExeFileNames {
 }
 
 function Get-RuleGroupId {
-    $md5Provider = New-Object System.Security.Cryptography.MD5CryptoServiceProvider
-    $hashBytes = $md5Provider.ComputeHash([System.Text.Encoding]::UTF8.GetBytes((Get-Date).ToString()))
-    return -join ($hashBytes | ForEach-Object { $_.ToString("x2") })
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+    # 32 hex chars, same shape as the MD5 hash it replaces, without needing to dispose a crypto object.
+    [guid]::NewGuid().ToString('N')
 }
 
-function Format-IoaDescription {
+function New-RuleObject {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
     param(
-        [AllowNull()]
-        [string]$Description
+        [Parameter(Mandatory)] $Tool,
+        [Parameter(Mandatory)] [System.Collections.Generic.HashSet[string]]$ExeFileNames,
+        [Parameter(Mandatory)] [string]$RuleId,
+        [Parameter(Mandatory)] [string]$RuleGroupId,
+        [Parameter(Mandatory)] [bool]$EnableRule,
+        [Parameter(Mandatory)] [int]$ResponseAction,
+        [Parameter(Mandatory)] [string]$Severity
     )
 
-    if ([string]::IsNullOrWhiteSpace($Description)) {
-        return ''
-    }
+    $description = ($Tool.Description -replace '\\n', '' -replace ' More information will be added as it becomes available\.', '').Trim()
+    $combinedExeFileNames = "(?i).*\\({0})\.exe" -f ($ExeFileNames -join '|')
 
-    $safeDescription = $Description -replace '\\n|[\r\n\t]+', ' ' -replace ' More information will be added as it becomes available\.', ''
-    @{
-        [char]0x00A0 = ' '
-        [char]0x00A9 = '(c)'
-        [char]0x0130 = 'I'
-        [char]0x015E = 'S'
-        [char]0x015F = 's'
-        [char]0x2013 = '-'
-        [char]0x2014 = '-'
-        [char]0x2018 = "'"
-        [char]0x2019 = "'"
-        [char]0x201C = '"'
-        [char]0x201D = '"'
-        [char]0x2026 = '...'
-        [char]0x2192 = '->'
-    }.GetEnumerator() | ForEach-Object {
-        $safeDescription = $safeDescription.Replace([string]$_.Key, $_.Value)
-    }
-
-    return ($safeDescription -replace '[^\x20-\x7E]', '' -replace '\s+', ' ').Trim()
-}
-
-function Create-RuleObject {
-    param(
-        $tool,
-        $exeFileNames,
-        $ruleId,
-        $ruleGroupId,
-        $enableRule,
-        $responseAction
-    )
-
-    $description = Format-IoaDescription -Description $tool.Description
-    $joinedExeFileNames = "(?i).*\\(" + ($exeFileNames -join '|') + ")\.exe"
-
-    return [PSCustomObject]@{
-        instance_id      = $ruleId
+    [PSCustomObject]@{
+        instance_id      = $RuleId
         ruletype_id      = "1" # Windows Process
         comment          = ""
-        enabled          = $enableRule
+        enabled          = $EnableRule
         deleted          = $false
-        rulegroup_id     = $ruleGroupId
+        rulegroup_id     = $RuleGroupId
         instance_version = 1
-        name             = $tool.Name
+        name             = $Tool.Name
         description      = $description
         pattern_severity = $Severity
-        disposition_id   = $responseAction # 10 - Monitor, 20 - Detect, 30 - Block Execution
+        disposition_id   = $ResponseAction # 10 = Monitor, 20 = Detect, 30 = Block Execution
         field_values     = @(
             [PSCustomObject]@{
                 name   = "ImageFilename"
-                value  = $joinedExeFileNames
+                value  = ""
                 label  = "Image Filename"
                 type   = "excludable"
                 values = @(
-                    @{
+                    [PSCustomObject]@{
                         label = "include"
-                        value = $joinedExeFileNames
+                        value = $combinedExeFileNames
                     }
                 )
             }
@@ -217,163 +175,116 @@ function Create-RuleObject {
 }
 
 function Export-JsonAndCompress {
+    [CmdletBinding()]
     param(
-        $jsonObject,
-        [string]$outputJson,
-        [string]$zipFile
+        [Parameter(Mandatory)] $RuleGroupObject,
+        [Parameter(Mandatory)] [string]$OutputJsonPath,
+        [Parameter(Mandatory)] [string]$ZipFilePath
     )
 
     try {
-        @($jsonObject) |
-        ConvertTo-Json -Depth 20 |
-        Set-Content -LiteralPath $outputJson -Encoding utf8
-        Write-LogEntry -msg "Saved to $outputJson" -level success
+        "[$($RuleGroupObject | ConvertTo-Json -Depth 10)]" | Set-Content -Path $OutputJsonPath -Encoding utf8
+        Write-LogEntry -Message "Saved to $OutputJsonPath" -Level success
 
-        if (Test-Path $zipFile) { 
-            Remove-Item -LiteralPath $zipFile -Force 
-        }
-        Compress-Archive -LiteralPath $outputJson -DestinationPath $zipFile -Force
-        Write-LogEntry -msg "Compressed the json, created $zipFile" -level success
+        if (Test-Path $ZipFilePath) { Remove-Item $ZipFilePath -Force }
+        Compress-Archive -Path $OutputJsonPath -DestinationPath $ZipFilePath
+        Write-LogEntry -Message "Compressed the JSON into $ZipFilePath" -Level success
     }
     catch {
-        Write-LogEntry -msg "Failed to create the json or compress the file. Error: $_" -level error
-        exit 1
+        Write-LogEntry -Message "Failed to create the JSON file or compress it.`nError: $_" -Level error
+        throw
     }
 }
 
-function Write-PreviewSummary {
+function Request-IOAUpload {
+    [CmdletBinding()]
     param(
-        [int]$TotalToolsFetched,
-        [int]$RulesGenerated,
-        [string[]]$SkippedTools,
-        [System.Collections.Generic.Dictionary[string, System.Collections.Generic.HashSet[string]]]$ExecutableToolMap
+        [Parameter(Mandatory)] [string]$ZipFilePath
     )
 
-    $duplicateExecutableNames = @(
-        foreach ($entry in $ExecutableToolMap.GetEnumerator()) {
-            if ($entry.Value.Count -gt 1) {
-                [PSCustomObject]@{
-                    Name  = $entry.Key
-                    Tools = @($entry.Value)
-                }
-            }
-        }
-    )
-
-    Write-LogEntry -msg "Preview summary before export:" -level info
-    Write-LogEntry -msg "Total tools fetched: $TotalToolsFetched" -level info
-    Write-LogEntry -msg "Rules generated: $RulesGenerated" -level info
-    Write-LogEntry -msg "Skipped tools: $($SkippedTools.Count)" -level info
-    Write-LogEntry -msg "Duplicate executable names: $($duplicateExecutableNames.Count)" -level info
-
-    if ($SkippedTools.Count -gt 0) {
-        Write-LogEntry -msg "Skipped tool names: $($SkippedTools -join ', ')" -level info
-    }
-
-    foreach ($duplicate in $duplicateExecutableNames | Sort-Object -Property Name) {
-        Write-LogEntry -msg "Duplicate executable '$($duplicate.Name)' found in tools: $($duplicate.Tools -join ',')" -level warning
-    }
-}
-
-function Prompt-IOAUpload {
-    param(
-        [string]$zipFile
-    )
-
-    Write-LogEntry -msg "Checking for PSFalcon module ..." -level info
-
+    Write-LogEntry -Message "Checking for PSFalcon module ..." -Level info
     if (-not (Get-Module -ListAvailable -Name PSFalcon)) {
-        Write-LogEntry -msg "PSFalcon module is not installed. Skipping upload." -level warning
+        Write-LogEntry -Message "PSFalcon module is not installed. Skipping upload." -Level warning
         return
     }
 
-    $choice = Read-Host "Do you want to upload $zipFile now? (yes/no)"
-    if ($choice -match "^(y|yes)$") {
-        try {
-            Request-FalconToken
-            Write-LogEntry -msg "Falcon token obtained successfully." -level success
-            Write-LogEntry -msg "Importing Falcon configuraiton from $zipFile ..." -level success
-            Import-FalconConfig -Path $zipFile
-            Write-LogEntry -msg "Falcon configuration import completed." -level success
-            Write-LogEntry -msg "Remember to apply the rule group to applicable prevention policies to take effect." -level info
-        }
-        catch {
-            Write-LogEntry -msg "Failed to upload the file to Falcon. Error: $_" -level error
-        }
+    $userChoice = Read-Host "Do you want to upload $ZipFilePath now? (yes/no)"
+    if ($userChoice -notmatch '^(y|yes)$') {
+        Write-LogEntry -Message "Upload skipped. You can manually upload $ZipFilePath later using 'Import-FalconConfig' from the PSFalcon module." -Level info
+        return
     }
-    else {
-        Write-LogEntry -msg "Upload skipped. You can manually upload $zipFile later using 'Import-FalconConfig' from PSFalcon module" -level info
+
+    try {
+        Request-FalconToken
+        Write-LogEntry -Message "Falcon token obtained successfully." -Level success
+        Write-LogEntry -Message "Importing Falcon configuration from $ZipFilePath ..." -Level success
+        Import-FalconConfig -Path $ZipFilePath
+        Write-LogEntry -Message "Falcon configuration import completed." -Level success
+        Write-LogEntry -Message "Remember to apply the rule group to applicable prevention policies for it to take effect." -Level info
+    }
+    catch {
+        Write-LogEntry -Message "Failed to upload the file to Falcon.`nError: $_" -Level error
+    }
+    finally {
+        Revoke-FalconToken | Out-Null
     }
 }
 
-### MAIN ####
+### MAIN
+
 try {
-    $jsonData = Get-RMMData -url "https://lolrmm.io/api/rmm_tools.json"
-    $rules = New-Object System.Collections.Generic.List[PSCustomObject]
-    $ruleIds = New-Object System.Collections.Generic.List[String]
-    $skippedTools = New-Object System.Collections.Generic.List[String]
-    $executableToolMap = New-Object 'System.Collections.Generic.Dictionary[string, System.Collections.Generic.HashSet[string]]'([System.StringComparer]::OrdinalIgnoreCase)
-    $ruleCounter = $StartingRuleId
-    $ruleGroupId = Get-RuleGroupId
-    $rulesEnabled = if ($EnableRules) { $true } else { $false }
-    $groupDisabled = if ($DisableRuleGroup) { $false } else { $true }
-
-    switch ($ResponseType) {
-        "Monitor" { $responseAction = 10 }
-        "Detect" { $responseAction = 20 }
-        "Block" { $responseAction = 30 }
-        default { $responseAction = 20 }
-    }
-
-    Write-LogEntry -msg "LOLRMM Falon IOA Rule Generator" -level info
-    Write-LogEntry -msg "Source: https://lolrmm.io/api/rmm_tools.json" -level info
-    Write-LogEntry -msg "Mode: $ResponseType | Severity: $Severity | Rules enabled: $enableRules | Rule Group ID: $ruleGroupId" -level info
-
-    foreach ($tool in $jsonData) {
-        $exeFileNames = Get-ExeFileNames -tool $tool
-        if ($exeFileNames.Count -ge 1) {
-            foreach ($exeFileName in $exeFileNames) {
-                if ([string]::IsNullOrWhiteSpace($exeFileName)) {
-                    continue
-                }
-
-                if (-not $executableToolMap.ContainsKey($exeFileName)) {
-                    $executableToolMap[$exeFileName] = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
-                }
-
-                $executableTOolMap[$exeFileName].Add($tool.Name) | Out-Null
-            }
-
-            $ruleId = $ruleCounter.ToString()
-            $ruleIds += $ruleId
-            $rules += Create-RuleObject -tool $tool -exeFileNames $exeFileNames -ruleId $ruleId -ruleGroupId $ruleGroupId -enableRule $rulesEnabled -ResponseAction $responseAction
-            $ruleCounter++
-        }
-        else {
-            $skippedTools.Add($tool.Name) | Out-Null
-        }
-    }
-
-    $ruleSetObject = [PSCustomObject]@{
-        id          = $ruleGroupId
-        enabled     = $groupDisabled
-        name        = "LOLRMM Tools - Windows"
-        description = "Process creation rules for common RMM tools based on lolrmm.io"
-        platform    = "windows"
-        deleted     = $false
-        rules       = $rules
-        rule_ids    = $ruleIds
-        version     = 1
-    }
-
-    Write-PreviewSummary -TotalToolsFetched @($jsonData).Count -RulesGenerated $rules.Count -SkippedTools $skippedTools -ExecutableToolMap $executableToolMap
-
-    Export-JsonAndCompress -jsonObject $ruleSetObject -outputJson "IoaGroup.json" -zipFile $ZipFile
-    Prompt-IOAUpload -zipFile $ZipFile
-
-    Write-LogEntry -msg "Clearing Falcon Token" -level success
-    Revoke-FalconToken | Out-Null
+    $rmmToolData = Get-RMMData -Url $RmmToolsUrl
 }
 catch {
-    Write-LogEntry -msg $_.Exception.Message -level error
+    exit 1
 }
+
+$rules = [System.Collections.Generic.List[pscustomobject]]::new()
+$ruleIds = [System.Collections.Generic.List[string]]::new()
+$ruleCounter = $StartingRuleId
+$ruleGroupId = Get-RuleGroupId
+$isRuleEnabled = [bool]$EnableRules
+$isRuleGroupEnabled = -not $DisableRuleGroup
+
+$responseAction = switch ($ResponseType) {
+    'monitor' { 10 }
+    'block' { 30 }
+    default { 20 } # detect
+}
+
+Write-LogEntry -Message "Starting Rule ID: $StartingRuleId" -Level info
+Write-LogEntry -Message "Rule Group ID: $ruleGroupId" -Level info
+Write-LogEntry -Message "Enable all rules: $isRuleEnabled" -Level info
+Write-LogEntry -Message "Enable rule group: $isRuleGroupEnabled" -Level info
+
+foreach ($tool in $rmmToolData) {
+    try {
+        $exeFileNames = Get-ExeFileNames -Tool $tool
+        if ($exeFileNames.Count -ge 1) {
+            $ruleId = $ruleCounter.ToString()
+            $ruleIds.Add($ruleId)
+            $rules.Add((New-RuleObject -Tool $tool -ExeFileNames $exeFileNames -RuleId $ruleId `
+                        -RuleGroupId $ruleGroupId -EnableRule $isRuleEnabled -ResponseAction $responseAction `
+                        -Severity $Severity))
+            $ruleCounter++
+        }
+    }
+    catch {
+        Write-LogEntry -Message "Skipping '$($tool.Name)' - failed to build rule.`nError: $_" -Level warning
+    }
+}
+
+$ruleSetObject = [PSCustomObject]@{
+    id          = $ruleGroupId
+    enabled     = $isRuleGroupEnabled
+    name        = "LOLRMM Tools - Windows"
+    description = "Process creation rules for common RMM tools based on lolrmm.io"
+    platform    = "windows"
+    deleted     = $false
+    rules       = $rules
+    rule_ids    = $ruleIds
+    version     = 1
+}
+
+Export-JsonAndCompress -RuleGroupObject $ruleSetObject -OutputJsonPath $OutputJsonPath -ZipFilePath $ZipFile
+Request-IOAUpload -ZipFilePath $ZipFile
